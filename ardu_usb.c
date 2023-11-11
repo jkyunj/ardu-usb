@@ -1,8 +1,9 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/usb.h>
+#include <linux/kdev_t.h>
+#include <linux/fs.h>
 
-#define IS_NEW_METHOD_USED (1)
 #define USB_VENDOR_ID (0x2341)
 #define USB_PRODUCT_ID (0x0043)
 #define PRINT_USB_INTERFACE_DESCRIPTOR(i)                                    \
@@ -32,6 +33,8 @@
                 pr_info("bInterval: 0x%x\n", e.bInterval);               \
                 pr_info("\n");                                           \
         }
+
+dev_t dev = 0;
 
 static int ardu_usb_probe(struct usb_interface *interface,
                           const struct usb_device_id *id)
@@ -73,23 +76,28 @@ static struct usb_driver ardu_usb_driver = {
     .id_table = ardu_usb_table,
 };
 
-#if (IS_NEW_METHOD_USED)
-module_usb_driver(ardu_usb_driver);
-
-#else
 static int __init ardu_usb_init(void)
 {
-        return usb_register(&ardu_usb_driver);
+	if((alloc_chrdev_region(&dev, 0, 1, "ardu_usb")) < 0) {
+		pr_info("fail to alloc_chrdev_region\n");
+		return -1;
+	}
+
+	pr_info("ardu_usb is loaded successfully\n");
+	
+	return 0;
 }
+
 static void __exit ardu_usb_exit(void)
 {
-        usb_deregister(&ardu_usb_driver);
+	unregister_chrdev_region(dev, 1);
+	pr_info("ardu_usb is unloaded\n");
 }
+
 module_init(ardu_usb_init);
 module_exit(ardu_usb_exit);
-#endif
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jaekyun Jang <jaegun0103@ajou.ac.kr>");
 MODULE_DESCRIPTION("arduino device driver to connect with usb");
-MODULE_VERSION("1.0.0");
+MODULE_VERSION("1.0.1");
