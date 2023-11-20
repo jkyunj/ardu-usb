@@ -2,6 +2,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/usb.h>
+#include <linux/kref.h>
 #include <linux/kdev_t.h>
 #include <linux/fs.h>
 #include <linux/err.h>
@@ -14,6 +15,12 @@
 #define USB_VENDOR_ID	(0x2341)
 #define USB_PRODUCT_ID	(0x0043)
 
+const struct usb_device_id ardu_usb_table[] = {
+    {USB_DEVICE(USB_VENDOR_ID, USB_PRODUCT_ID)}, // Put your USB device's Vendor and Product ID
+    {}                                           /* Terminating entry */
+};
+MODULE_DEVICE_TABLE(usb, ardu_usb_table);
+
 #define PRINT_USB_INTERFACE_DESCRIPTOR(i)                                    \
         {                                                                    \
                 pr_info("USB_INTERFACE_DESCRIPTOR:\n");                      \
@@ -21,7 +28,7 @@
                 pr_info("bLength: 0x%x\n", i.bLength);                       \
                 pr_info("bDescriptorType: 0x%x\n", i.bDescriptorType);       \
                 pr_info("bInterfaceNumber: 0x%x\n", i.bInterfaceNumber);     \
-               pr_info("bAlternateSetting: 0x%x\n", i.bAlternateSetting);   \
+                pr_info("bAlternateSetting: 0x%x\n", i.bAlternateSetting);   \
                 pr_info("bNumEndpoints: 0x%x\n", i.bNumEndpoints);           \
                 pr_info("bInterfaceClass: 0x%x\n", i.bInterfaceClass);       \
                 pr_info("bInterfaceSubClass: 0x%x\n", i.bInterfaceSubClass); \
@@ -47,12 +54,37 @@ static struct class *dev_class;
 static struct cdev ardu_cdev;
 int *kbuf;
 
+static void	ardu_delete(struct kref *kref);
 static int	ardu_open(struct inode *inode, struct file *file);
 static int	ardu_release(struct inode *inode, struct file *file);
 static ssize_t	ardu_read(struct file *file, char __user *buf, size_t len, loff_t *off);
 static ssize_t	ardu_write(struct file *file, const char *buf, size_t len, loff_t *off);
 
+struct ardu_usb {
+	struct usb_device	*udev;
+	struct usb_interface	*interface;
+	struct semaphore	limit_sem;
+	struct usb_anchor	Submitted;
+	struct urb		*bulk_in_urb;
+	unsigned char		*bulk_in_buffer;
+	size_t			bulk_in_size;
+	size_t			bulk_in_filled;
+	size_t			bulk_in_copied;
+	__u8			bulk_in_endpointAddr;
+	int			errors;
+	bool			ongoing_read;
+	spinlock_t		err_lock;
+	struct kref		kref;
+	struct mutex		io_mutex;
+	unsigned long		disconnected:1;
+	wait_queue_head_t	bulk_in_wait;
+};
+#define to_ardu_dev(d)	container_of(d, struct ardu_usb, kref);
+
+static struct usb_driver ardu_usb_driver;
+
 static struct file_operations fops = 
+
 {
 	.owner		= THIS_MODULE,
 	.read		= ardu_read,
@@ -61,10 +93,55 @@ static struct file_operations fops =
 	.release	= ardu_release,
 };
 
+static void ardu_draw_down(struct ardu_usb *dev);
+
+static void ardu_delete(struct kref *kref)
+{
+	struct ardu_usb *dev = to_ardu_dev(kref);
+
+	usb_free_urb(dev->bulk_in_urb);
+	usb_put_intf(dev->interface);
+	usb_put_dev(dev->udev);
+	kfree(dev->bulk_in_buffer);
+	kfree(dev);
+}
+
 static int ardu_open(struct inode *inode, struct file *file)
 {
+	struct ardu_usb *dev;
+	struct usb_interface *interface;
+	int subminor;
+	int retval = 0;
+
+	subminor = iminor(inode);
+	pr_info("subminor: %d\n", subminor); 
+
+	interface = usb_find_interface(&ardu_usb_driver, subminor);
+	if(!interface) {
+		pr_err("%s - error, can't find device for minor %d\n", 
+				__func__, subminor);
+		retval = -ENODEV;
+		goto exit;
+	}
+
+	dev = usb_get_intfdata(interface);
+	if(!dev) {
+		retval = -ENODEV;
+		goto exit;
+	}
+
+	retval = usb_autopm_get_interface(interface);
+	if(retval)
+		goto exit;
+
+	kref_get(&dev->kref);
+
+	file->private_data = dev;
+
 	pr_info("ardu_open is called\n");
-	return 0;
+	
+exit:
+	return retval;
 }
 
 static int ardu_release(struct inode *inode, struct file *file)
@@ -117,22 +194,16 @@ static void ardu_usb_disconnect(struct usb_interface *interface)
         dev_info(&interface->dev, "USB Driver Disconnected\n");
 }
 
-const struct usb_device_id ardu_usb_table[] = {
-    {USB_DEVICE(USB_VENDOR_ID, USB_PRODUCT_ID)}, // Put your USB device's Vendor and Product ID
-    {}                                           /* Terminating entry */
-};
 
-MODULE_DEVICE_TABLE(usb, ardu_usb_table);
-
-static struct usb_driver ardu_usb_driver = {
-    .name = "Arduino USB Driver",
-    .probe = ardu_usb_probe,
-    .disconnect = ardu_usb_disconnect,
-    .id_table = ardu_usb_table,
-};
 
 static int __init ardu_usb_init(void)
 {
+
+	if((usb_register(&ardu_usb_driver)) < 0) {
+		pr_info("fail to usb_register\n");
+		return -1;
+	}
+
 	if((register_chrdev_region(dev, 1, "ardu_usb")) < 0) {
 		pr_info("fail to alloc_chrdev_region\n");
 		return -1;
@@ -177,6 +248,7 @@ err_class:
 
 static void __exit ardu_usb_exit(void)
 {
+	usb_deregister(&ardu_usb_driver);
 	kfree(kbuf);
 	device_destroy(dev_class, dev);
 	class_destroy(dev_class);
@@ -184,6 +256,13 @@ static void __exit ardu_usb_exit(void)
 	unregister_chrdev_region(dev, 1);
 	pr_info("ardu_usb is unloaded\n");
 }
+
+static struct usb_driver ardu_usb_driver = {
+    .name = "Arduino USB Driver",
+    .probe = ardu_usb_probe,
+    .disconnect = ardu_usb_disconnect,
+    .id_table = ardu_usb_table,
+};
 
 module_init(ardu_usb_init);
 module_exit(ardu_usb_exit);
