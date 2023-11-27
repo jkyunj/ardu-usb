@@ -1,25 +1,22 @@
 #include <linux/kernel.h>
-#include <linux/init.h>
+#include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/usb.h>
+#include <linux/errno.h>
 #include <linux/kref.h>
-#include <linux/kdev_t.h>
-#include <linux/fs.h>
-#include <linux/err.h>
-#include <linux/device.h>
-#include <linux/cdev.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
-#define MEM_SIZ	1024
-#define USB_VENDOR_ID	(0x2341)
-#define USB_PRODUCT_ID	(0x0043)
+#define ARDU_VENDOR_ID	(0x2341)
+#define ARDU_PRODUCT_ID	(0x0043)
 
 const struct usb_device_id ardu_usb_table[] = {
-    {USB_DEVICE(USB_VENDOR_ID, USB_PRODUCT_ID)}, // Put your USB device's Vendor and Product ID
-    {}                                           /* Terminating entry */
+    {USB_DEVICE(ARDU_VENDOR_ID, ARDU_PRODUCT_ID)}, 
+    {}
 };
 MODULE_DEVICE_TABLE(usb, ardu_usb_table);
+
+#define ARDU_MINOR_BASE	0
 
 #define PRINT_USB_INTERFACE_DESCRIPTOR(i)                                    \
         {                                                                    \
@@ -48,43 +45,235 @@ MODULE_DEVICE_TABLE(usb, ardu_usb_table);
                 pr_info("bInterval: 0x%x\n", e.bInterval);               \
                 pr_info("\n");                                           \
         }
-
-dev_t dev = MKDEV(234, 0);
-static struct class *dev_class;
-static struct cdev ardu_cdev;
-int *kbuf;
-
-static void	ardu_delete(struct kref *kref);
-static int	ardu_open(struct inode *inode, struct file *file);
-static int	ardu_release(struct inode *inode, struct file *file);
-static ssize_t	ardu_read(struct file *file, char __user *buf, size_t len, loff_t *off);
-static ssize_t	ardu_write(struct file *file, const char *buf, size_t len, loff_t *off);
-
 struct ardu_usb {
-	struct usb_device	*udev;
+	struct usb_device		*udev;
 	struct usb_interface	*interface;
-	struct semaphore	limit_sem;
-	struct usb_anchor	Submitted;
-	struct urb		*bulk_in_urb;
-	unsigned char		*bulk_in_buffer;
-	size_t			bulk_in_size;
-	size_t			bulk_in_filled;
-	size_t			bulk_in_copied;
-	__u8			bulk_in_endpointAddr;
-	int			errors;
-	bool			ongoing_read;
-	spinlock_t		err_lock;
-	struct kref		kref;
-	struct mutex		io_mutex;
-	unsigned long		disconnected:1;
-	wait_queue_head_t	bulk_in_wait;
+	struct urb				*bulk_in_urb;
+	unsigned char			*bulk_in_buffer, *ctrl_buffer;
+	size_t					bulk_in_size;
+	size_t					bulk_in_filled;
+	size_t					bulk_in_copied;
+	__u8					bulk_in_endpointAddr;
+	wait_queue_head_t		wq;
+	int						errors;
+	bool					ongoing;
+	spinlock_t				spin_lock;
+	struct mutex			mutex;
+	struct kref				kref;
+	unsigned long			disconnected:1;
 };
-#define to_ardu_dev(d)	container_of(d, struct ardu_usb, kref);
+
+#define to_ardu_dev(d) container_of(d, struct ardu_usb, kref)
+
+static void ardu_delete(struct kref *kref)
+{
+	struct ardu_usb *ardu = to_ardu_dev(kref);
+
+	usb_free_urb(ardu->bulk_in_urb);
+	usb_put_intf(ardu->interface);
+	usb_put_dev(ardu->udev);
+	kfree(ardu->bulk_in_buffer);
+	kfree(ardu);
+}
 
 static struct usb_driver ardu_usb_driver;
 
-static struct file_operations fops = 
+static int ardu_open(struct inode *inode, struct file *file)
+{
+	struct ardu_usb *ardu;
+	struct usb_interface *interface;
+	int rv = 0;
 
+	interface = usb_find_interface(&ardu_usb_driver, iminor(inode));
+	if(!interface) {
+		pr_err("%s Error: cannot find interface #%d\n",
+			__func__, iminor(inode));
+		rv = -ENODEV;
+		goto exit;
+	}
+
+	ardu = usb_get_intfdata(interface);
+	if(!ardu) {
+		rv = -ENODEV;
+		goto exit;
+	}
+
+	rv = usb_autopm_get_interface(interface);
+	if(rv)
+		goto exit;
+
+	kref_get(&ardu->kref);
+
+	file->private_data = ardu;
+
+	printk("ardu_open is called\n");
+exit:
+	return rv;
+}
+
+static int ardu_release(struct inode *inode, struct file *file)
+{
+	struct ardu_usb *ardu = file->private_data;
+	if(!ardu)
+		return -ENODEV;
+
+	usb_autopm_put_interface(ardu->interface);
+
+	kref_put(&ardu->kref, ardu_delete);
+
+	printk("ardu_release is called\n");
+	return 0;
+}
+
+static void ardu_read_bulk_callback(struct urb *urb)
+{
+	struct ardu_usb *ardu;
+	unsigned long flags;
+
+	ardu = urb->context;
+
+	spin_lock_irqsave(&ardu->spin_lock, flags);
+	if (urb->status) {
+		if (!(urb->status == -ENOENT ||
+		    urb->status == -ECONNRESET ||
+		    urb->status == -ESHUTDOWN))
+			dev_err(&ardu->interface->dev,
+				"%s Error: error status received: %d\n",
+				__func__, urb->status);
+
+		ardu->errors = urb->status;
+		printk("urb status: %d\n", urb->status);
+	} else {
+		ardu->bulk_in_filled = urb->actual_length;
+		printk("urb actual_length: %d\n", urb->actual_length);
+	}
+	ardu->ongoing = 0;
+	spin_unlock_irqrestore(&ardu->spin_lock, flags);
+
+	wake_up_interruptible(&ardu->wq);
+
+}
+
+
+static int ardu_do_read(struct ardu_usb *ardu, size_t len)
+{
+	int rv;
+
+	usb_fill_bulk_urb(ardu->bulk_in_urb,
+		ardu->udev,
+		usb_rcvbulkpipe(ardu->udev, ardu->bulk_in_endpointAddr),
+		ardu->bulk_in_buffer,
+		min(ardu->bulk_in_size, len),
+		ardu_read_bulk_callback,
+		ardu);
+
+	spin_lock_irq(&ardu->spin_lock);
+	ardu->ongoing = 1;
+	spin_unlock_irq(&ardu->spin_lock);
+
+	ardu->bulk_in_filled = 0;
+	ardu->bulk_in_copied = 0;
+
+	rv = usb_submit_urb(ardu->bulk_in_urb, GFP_KERNEL);
+	if (rv < 0) {
+		dev_err(&ardu->interface->dev,
+			"%s Error: fail to submit read urb, errorno %d\n",
+			__func__, rv);
+		spin_lock_irq(&ardu->spin_lock);
+		ardu->ongoing = 0;
+		spin_unlock_irq(&ardu->spin_lock);
+	}
+
+	return rv;
+}
+
+static ssize_t ardu_read(struct file *file, char __user *buf, size_t len, loff_t *off)
+{
+	struct ardu_usb *ardu;
+	int rv;
+	bool ongoing;
+
+	ardu = file->private_data;
+
+	if(!ardu->bulk_in_urb || !len)
+		return 0;
+
+	rv = mutex_lock_interruptible(&ardu->mutex);
+	if(rv < 0)
+		return rv;
+	
+	if(ardu->disconnected) {
+		rv = -ENODEV;
+		goto exit;
+	}
+
+retry:
+	spin_lock_irq(&ardu->spin_lock);
+	ongoing = ardu->ongoing;
+	spin_unlock_irq(&ardu->spin_lock);
+
+	if(ongoing) {
+		if(file->f_flags & O_NONBLOCK) {
+			rv = -EAGAIN;
+			goto exit;
+		}
+	
+		rv = wait_event_interruptible(ardu->wq, (!ardu->ongoing));
+		if(rv < 0)
+			goto exit;
+	}
+
+	rv = ardu->errors;
+	if(rv < 0) {
+		ardu->errors = 0;
+		goto exit;
+	}
+
+	if(ardu->bulk_in_filled) {
+		size_t avail = ardu->bulk_in_filled - ardu->bulk_in_copied;
+		size_t chunk = min(avail, len);
+
+		if(!avail) {
+			rv = ardu_do_read(ardu, len);
+			if(rv < 0)
+				goto exit;
+			else
+				goto retry;
+		}
+
+		if(copy_to_user(buf,
+				ardu->bulk_in_buffer + ardu->bulk_in_copied,
+				chunk))
+			rv = -EFAULT;
+		else
+			rv = chunk;
+
+		ardu->bulk_in_copied += chunk;
+
+		if(avail < len)
+			ardu_do_read(ardu, len - chunk);
+	} else {
+		/* no filled data in buffer */
+		rv = ardu_do_read(ardu, len);
+
+		if(rv < 0)
+			goto exit;
+		else
+			goto retry;
+	}
+
+	printk("ardu_read is called\n");
+exit:
+	mutex_unlock(&ardu->mutex);
+	return rv;
+}
+
+static ssize_t ardu_write(struct file *file, const char *user_buffer, size_t len, loff_t *off)
+{
+	return 0;
+}
+
+static struct file_operations ardu_fops = 
 {
 	.owner		= THIS_MODULE,
 	.read		= ardu_read,
@@ -93,83 +282,9 @@ static struct file_operations fops =
 	.release	= ardu_release,
 };
 
-static void ardu_draw_down(struct ardu_usb *dev);
-
-static void ardu_delete(struct kref *kref)
-{
-	struct ardu_usb *dev = to_ardu_dev(kref);
-
-	usb_free_urb(dev->bulk_in_urb);
-	usb_put_intf(dev->interface);
-	usb_put_dev(dev->udev);
-	kfree(dev->bulk_in_buffer);
-	kfree(dev);
-}
-
-static int ardu_open(struct inode *inode, struct file *file)
-{
-	struct ardu_usb *dev;
-	struct usb_interface *interface;
-	int subminor;
-	int retval = 0;
-
-	subminor = iminor(inode);
-	pr_info("subminor: %d\n", subminor); 
-
-	interface = usb_find_interface(&ardu_usb_driver, subminor);
-	if(!interface) {
-		pr_err("%s - error, can't find device for minor %d\n", 
-				__func__, subminor);
-		retval = -ENODEV;
-		goto exit;
-	}
-
-	dev = usb_get_intfdata(interface);
-	if(!dev) {
-		retval = -ENODEV;
-		goto exit;
-	}
-
-	retval = usb_autopm_get_interface(interface);
-	if(retval)
-		goto exit;
-
-	kref_get(&dev->kref);
-
-	file->private_data = dev;
-
-	pr_info("ardu_open is called\n");
-	
-exit:
-	return retval;
-}
-
-static int ardu_release(struct inode *inode, struct file *file)
-{
-	pr_info("ardu_release is called\n");
-	return 0;
-}
-
-static ssize_t ardu_read(struct file *file, char __user *buf, size_t len, loff_t *off)
-{
-	if(copy_to_user(buf, kbuf, MEM_SIZ)) {
-		pr_err("cannot copy data to user\n");
-	}
-	pr_info("copy data to user\n");
-	return MEM_SIZ;
-}
-
-static ssize_t ardu_write(struct file *file, const char *buf, size_t len, loff_t *off)
-{
-	if(copy_from_user(kbuf, buf, len)) {
-		pr_err("cannot copy data from user\n");
-	}
-	pr_info("copy data from user\n");
-	return len;
-}
-
-static int ardu_usb_probe(struct usb_interface *interface,
-                          const struct usb_device_id *id)
+#ifdef DEBUG
+static int ardu_print_desc(struct usb_interface *interface, 
+								const struct usb_device_id *id)
 {
         unsigned int i;
         unsigned int endpoints_count;
@@ -188,86 +303,149 @@ static int ardu_usb_probe(struct usb_interface *interface,
         }
         return 0;
 }
+#endif
 
-static void ardu_usb_disconnect(struct usb_interface *interface)
-{
-        dev_info(&interface->dev, "USB Driver Disconnected\n");
-}
-
-
-
-static int __init ardu_usb_init(void)
-{
-
-	if((usb_register(&ardu_usb_driver)) < 0) {
-		pr_info("fail to usb_register\n");
-		return -1;
-	}
-
-	if((register_chrdev_region(dev, 1, "ardu_usb")) < 0) {
-		pr_info("fail to alloc_chrdev_region\n");
-		return -1;
-	}
-	pr_info("ardu_usb: Major = %d Minor = %d\n", MAJOR(dev), MINOR(dev));
-
-	cdev_init(&ardu_cdev, &fops);
-
-	if(cdev_add(&ardu_cdev, dev, 1) < 0) {
-		pr_info("Cannot add the ardu_cdev\n");
-		goto err_class;
-	}
-
-	dev_class = class_create(THIS_MODULE, "ardu_dev");
-	if(IS_ERR(dev_class)) {
-		pr_err("cannot create the struct class for device\n");
-		goto err_class;
-	}
-
-	if(IS_ERR(device_create(dev_class, NULL, dev, NULL, "ardu_device"))) {
-		pr_err("Cannot create the ardu_dev\n");
-		goto err_device;
-	}
-
-	if((kbuf = (int*)kmalloc(MEM_SIZ, GFP_KERNEL)) == 0) {
-		pr_info("Cannot allocate kernel memory\n");
-		goto err_alloc;
-	}
-	memset(kbuf, 0, MEM_SIZ);
-
-	pr_info("ardu_usb is loaded successfully\n");
-	return 0;
-
-err_alloc:
-	device_destroy(dev_class, dev);
-err_device: 
-	class_destroy(dev_class);
-err_class:
-	unregister_chrdev_region(dev, 1);
-	return -1;
-}
-
-static void __exit ardu_usb_exit(void)
-{
-	usb_deregister(&ardu_usb_driver);
-	kfree(kbuf);
-	device_destroy(dev_class, dev);
-	class_destroy(dev_class);
-	cdev_del(&ardu_cdev);
-	unregister_chrdev_region(dev, 1);
-	pr_info("ardu_usb is unloaded\n");
-}
-
-static struct usb_driver ardu_usb_driver = {
-    .name = "Arduino USB Driver",
-    .probe = ardu_usb_probe,
-    .disconnect = ardu_usb_disconnect,
-    .id_table = ardu_usb_table,
+static struct usb_class_driver ardu_class = {
+	.name = 		"ardu%d",
+	.fops =			&ardu_fops,
+	.minor_base = 	ARDU_MINOR_BASE,
 };
 
-module_init(ardu_usb_init);
-module_exit(ardu_usb_exit);
+static int ardu_probe(struct usb_interface *interface, 
+				const struct usb_device_id *id)
+{
+		struct ardu_usb *ardu;
+		struct usb_endpoint_descriptor *bulk_in;
+		int rv;
+
+		ardu = kzalloc(sizeof(*ardu), GFP_KERNEL);
+		if(!ardu)
+			return -ENOMEM;
+
+		mutex_init(&ardu->mutex);
+		spin_lock_init(&ardu->spin_lock);
+		kref_init(&ardu->kref);
+		init_waitqueue_head(&ardu->wq);
+
+		ardu->udev = usb_get_dev(interface_to_usbdev(interface));
+		ardu->interface = usb_get_intf(interface);
+
+		rv = usb_find_common_endpoints(interface->cur_altsetting,
+					&bulk_in, NULL, NULL, NULL);
+		if(rv) {
+			dev_err(&interface->dev,
+				"could not find bulk-in\n");
+				goto err;
+		}
+
+		ardu->bulk_in_size = usb_endpoint_maxp(bulk_in);
+		ardu->bulk_in_endpointAddr = bulk_in->bEndpointAddress;
+		ardu->bulk_in_buffer = kmalloc(ardu->bulk_in_size, GFP_KERNEL);
+		if(!ardu->bulk_in_buffer) {
+			rv = -ENOMEM;
+			goto err;
+		}
+		ardu->bulk_in_urb = usb_alloc_urb(0, GFP_KERNEL);
+		if(!ardu->bulk_in_urb) {
+			rv = -ENOMEM;
+			goto err;
+		}
+
+		/* send control message to communicate */
+		ardu->ctrl_buffer = kzalloc(8, GFP_KERNEL);
+		if(!ardu->ctrl_buffer) {
+			rv = -ENOMEM;
+			goto err;
+		}
+		rv = usb_control_msg(ardu->udev, 
+				usb_sndctrlpipe(ardu->udev, 0), 
+				0x22, 
+				0x21, 
+				cpu_to_le16(0x00), 
+				cpu_to_le16(0x00), 
+				ardu->ctrl_buffer,
+				cpu_to_le16(0x00), 
+				0);
+		if(rv < 0) {
+			dev_err(&interface->dev,
+				"could not send control command(1) message\n");
+				goto err;	
+		}
+
+		ardu->ctrl_buffer[0] = 0x80;
+		ardu->ctrl_buffer[1] = 0x25;
+		ardu->ctrl_buffer[6] = 0x08;
+
+		rv = usb_control_msg(ardu->udev, 
+				usb_sndctrlpipe(ardu->udev, 0), 
+				0x20, 
+				0x21, 
+				cpu_to_le16(0x00), 
+				cpu_to_le16(0x00), 
+				ardu->ctrl_buffer,
+				cpu_to_le16(0x08), 
+				0);
+		if(rv < 0)
+		{
+			dev_err(&interface->dev,
+				"could not send control command(2) message\n");
+				goto err;
+		}	
+
+		usb_set_intfdata(interface, ardu);
+
+		rv = usb_register_dev(interface, &ardu_class);
+		if(rv) {
+			dev_err(&interface->dev,
+				"cannot register usb device\n");
+			usb_set_intfdata(interface, NULL);
+			goto err;
+		}
+
+		dev_info(&interface->dev,
+			"ardu usb device attached to /dev/ardu%d",
+			interface->minor);
+		
+		// ardu_print_desc(interface, id);
+
+		return 0;
+
+err:
+	kref_put(&ardu->kref, ardu_delete);
+	return rv;
+}
+
+static void ardu_disconnect(struct usb_interface *interface)
+{
+	struct ardu_usb *ardu;
+	int minor = interface->minor;
+
+	ardu = usb_get_intfdata(interface);
+	usb_set_intfdata(interface, NULL);
+
+	usb_deregister_dev(interface, &ardu_class);
+
+	mutex_lock(&ardu->mutex);
+	ardu->disconnected = 1;
+	mutex_unlock(&ardu->mutex);
+
+	kref_put(&ardu->kref, ardu_delete);
+	
+	dev_info(&interface->dev, "ardu-usb #%d is disconnected\n", minor);
+}
+
+
+static struct usb_driver ardu_usb_driver = {
+    .name = "ardu-usb",
+    .probe = ardu_probe,
+    .disconnect = ardu_disconnect,
+    .id_table = ardu_usb_table,
+	.supports_autosuspend = 1,
+};
+
+module_usb_driver(ardu_usb_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jaekyun Jang <jaegun0103@ajou.ac.kr>");
 MODULE_DESCRIPTION("arduino device driver to connect with usb");
-MODULE_VERSION("1.0.3");
+MODULE_VERSION("1.0.4");
